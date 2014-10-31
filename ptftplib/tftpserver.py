@@ -154,8 +154,20 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
             return self.finish_state(peer_state)
 
         try:
-            peer_state.file = open(peer_state.filepath, 'rb')
-            peer_state.filesize = os.stat(peer_state.filepath)[stat.ST_SIZE]
+            # If the file exists, open it
+            if os.path.isfile(peer_state.filepath) and\
+                    os.access(peer_state.filepath, os.R_OK):
+                        peer_state.file = open(peer_state.filepath, 'rb')
+                        peer_state.filesize = os.stat(peer_state.filepath)[stat.ST_SIZE]
+            else:
+                # The file doen't exist, try the dynamic_file_handler
+                # if it is set
+                if hasattr(self, 'dynamic_file_handler') and\
+                    self.dynamic_file_handler is not None:
+                        peer_state.file, peer_state.filesize = self.dynamic_file_handler(peer_state.filepath)
+                else:
+                    raise IOError('Cannot access file: %s' % peer_state.filepath)
+
             peer_state.packetnum = 0
             peer_state.state = state.STATE_SEND
 
@@ -478,7 +490,7 @@ class TFTPServerGarbageCollector(threading.Thread):
 
 class TFTPServer(object):
     def __init__(self, iface, root, port=_PTFTPD_DEFAULT_PORT,
-                 strict_rfc1350=False, notification_callbacks=None):
+                 strict_rfc1350=False, notification_callbacks=None, dynamic_file_callback=None):
 
         if notification_callbacks is None:
             notification_callbacks = {}
@@ -491,9 +503,12 @@ class TFTPServer(object):
             raise TFTPServerConfigurationError(
                 "The specified TFTP root does not exist")
 
+        class _TFTPServerHandler(TFTPServerHandler):
+            dynamic_file_handler = dynamic_file_callback
+
         self.ip, self.netmask, self.mac = get_ip_config_for_iface(self.iface)
         self.server = socketserver.UDPServer((self.ip, port),
-                                             TFTPServerHandler)
+                                             _TFTPServerHandler)
         self.server.root = self.root
         self.server.strict_rfc1350 = self.strict_rfc1350
         self.server.clients = self.client_registry

@@ -561,6 +561,7 @@ def main():
                       default=logging.WARNING)
     parser.add_option("-D", "--debug", dest="loglevel", action="store_const",
                       const=logging.DEBUG, help="Output debugging information")
+    parser.add_option("-d", "--dynamic-file-handler", dest="dynamic_file_handler", help="Definition of the callback in the form module/file:function")
 
     (options, args) = parser.parse_args()
     if len(args) != 2:
@@ -575,8 +576,19 @@ def main():
                                 loglevel=options.loglevel,
                                 fmt='%(levelname)s(%(name)s): %(message)s')
 
+    dynamic_file_callback = None
+    if options.dynamic_file_handler:
+        import imp
+        file, func = options.dynamic_file_handler.split(':')
+        path, file = os.path.split(os.path.abspath(file))
+        module_name, _ = os.path.splitext(file)
+        res = imp.find_module(module_name, [path] + sys.path)
+        mod  = imp.load_module(module_name, *res)
+        dynamic_file_callback = getattr(mod, func)
+
     try:
-        server = TFTPServer(iface, root, options.port, options.strict_rfc1350)
+        server = TFTPServer(iface, root, options.port, options.strict_rfc1350,
+                            dynamic_file_callback=dynamic_file_callback)
         server.serve_forever()
     except TFTPServerConfigurationError as e:
         sys.stderr.write('TFTP server configuration error: %s!' %

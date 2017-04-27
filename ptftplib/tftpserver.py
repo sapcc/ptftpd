@@ -64,7 +64,7 @@ def get_ip_config_for_iface(iface):
 
     if iface not in netifaces.interfaces():
         raise TFTPServerConfigurationError(
-                'Unknown network interface {}'.format(iface))
+            'Unknown network interface {}'.format(iface))
 
     details = netifaces.ifaddresses(iface)
     inet = details[netifaces.AF_INET][0]
@@ -111,8 +111,8 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
         except AttributeError:
             l.error("Unsupported operation %s" % opcode)
             response = proto.TFTPHelper.createERROR(
-                    proto.ERROR_UNDEF,
-                    'Operation not supported by server.')
+                proto.ERROR_UNDEF,
+                'Operation not supported by server.')
 
         response = handler(opcode, request[2:])
         if response:
@@ -174,17 +174,17 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
         try:
             # If the file exists, open it
             # TODO: Windows clients request case insensitive, which may be a problem on *nix servers
-            if os.path.isfile(peer_state.filepath) and\
+            if os.path.isfile(peer_state.filepath) and \
                     os.access(peer_state.filepath, os.R_OK):
-                        peer_state.file = open(peer_state.filepath, 'rb')
-                        peer_state.filesize = os.stat(peer_state.filepath)[stat.ST_SIZE]
+                peer_state.file = open(peer_state.filepath, 'rb')
+                peer_state.filesize = os.stat(peer_state.filepath)[stat.ST_SIZE]
             else:
                 # The file doen't exist, try the dynamic_file_handler
                 # if it is set
-                if hasattr(self, 'dynamic_file_handler') and\
-                    self.dynamic_file_handler is not None:
-                        # we send the original requested filename to the handler
-                        peer_state.file, peer_state.filesize = self.dynamic_file_handler(filenameOrig)
+                if hasattr(self, '_dynamic_file_handler') and \
+                                self._dynamic_file_handler is not None:
+                    # we send the original requested filename to the handler
+                    peer_state.file, peer_state.filesize = self._dynamic_file_handler(filenameOrig)
                 else:
                     raise IOError('Cannot access file: %s' % filenameOrig)
 
@@ -346,6 +346,10 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
                 # Ignore duplicate N-1 ACK packets
                 l.debug('Got duplicate ACK packet #%d. Ignoring.' % num)
                 pass
+            elif peer_state.packetnum != num and self.server.ignore_invalid_ack:
+                l.warning('Got ACK with incoherent data packet number. '
+                          'Ignoring.', )
+
             elif peer_state.packetnum != num:
                 peer_state.state = state.STATE_ERROR
                 peer_state.error = proto.ERROR_ILLEGAL_OP
@@ -354,7 +358,7 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
                         extra=peer_state.extra(notify.TRANSFER_FAILED))
 
             if not self.server.strict_rfc1350 and \
-                    num == proto.TFTP_PACKETNUM_MAX - 1:
+                            num == proto.TFTP_PACKETNUM_MAX - 1:
                 l.debug('Packet number wraparound.')
 
             return peer_state.next()
@@ -432,7 +436,7 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
                 del self.server.clients[self.client_address]
 
             elif (not self.server.strict_rfc1350 and
-                  num == proto.TFTP_PACKETNUM_MAX-1):
+                          num == proto.TFTP_PACKETNUM_MAX - 1):
                 l.debug('Packet number wraparound.')
 
             return next_state
@@ -510,7 +514,8 @@ class TFTPServerGarbageCollector(threading.Thread):
 
 class TFTPServer(object):
     def __init__(self, iface, root, port=_PTFTPD_DEFAULT_PORT,
-                 strict_rfc1350=False, notification_callbacks=None, dynamic_file_callback=None):
+                 strict_rfc1350=False, notification_callbacks=None, dynamic_file_callback=None,
+                 ignore_invalid_ack=False):
 
         if notification_callbacks is None:
             notification_callbacks = {}
@@ -524,7 +529,7 @@ class TFTPServer(object):
                 "The specified TFTP root does not exist")
 
         class _TFTPServerHandler(TFTPServerHandler):
-            dynamic_file_handler = dynamic_file_callback
+            _dynamic_file_handler = dynamic_file_callback
 
         self.ip, self.netmask, self.mac = get_ip_config_for_iface(self.iface)
         self.server = socketserver.UDPServer((self.ip, port),
@@ -532,6 +537,7 @@ class TFTPServer(object):
         self.server.root = self.root
         self.server.strict_rfc1350 = self.strict_rfc1350
         self.server.clients = self.client_registry
+        self.server.ignore_invalid_ack = ignore_invalid_ack
         self.cleanup_thread = TFTPServerGarbageCollector(self.client_registry)
 
         # Add callback notifications
@@ -552,7 +558,7 @@ def main():
     parser.add_option("-r", "--rfc1350", dest="strict_rfc1350",
                       action="store_true", default=False,
                       help="Run in strict RFC1350 compliance mode, "
-                      "with no extensions")
+                           "with no extensions")
     parser.add_option("-p", "--port", dest="port", action="store", type="int",
                       default=_PTFTPD_DEFAULT_PORT, metavar="PORT",
                       help="Listen for TFTP requests on PORT")
@@ -561,7 +567,10 @@ def main():
                       default=logging.WARNING)
     parser.add_option("-D", "--debug", dest="loglevel", action="store_const",
                       const=logging.DEBUG, help="Output debugging information")
-    parser.add_option("-d", "--dynamic-file-handler", dest="dynamic_file_handler", help="Definition of the callback in the form module/file:function")
+    parser.add_option("-d", "--dynamic-file-handler", dest="dynamic_file_handler",
+                      help="Definition of the callback in the form module/file:function")
+    parser.add_option("-i", "--ignore-invalid-ack", dest="ignore_invalid_ack", action="store_true",
+                      help="Ignore invalid acknowledgements, instead of aborting", default=False)
 
     (options, args) = parser.parse_args()
     if len(args) != 2:
@@ -583,12 +592,12 @@ def main():
         path, file = os.path.split(os.path.abspath(file))
         module_name, _ = os.path.splitext(file)
         res = imp.find_module(module_name, [path] + sys.path)
-        mod  = imp.load_module(module_name, *res)
+        mod = imp.load_module(module_name, *res)
         dynamic_file_callback = getattr(mod, func)
 
     try:
         server = TFTPServer(iface, root, options.port, options.strict_rfc1350,
-                            dynamic_file_callback=dynamic_file_callback)
+                            dynamic_file_callback=dynamic_file_callback, ignore_invalid_ack=options.ignore_invalid_ack)
         server.serve_forever()
     except TFTPServerConfigurationError as e:
         sys.stderr.write('TFTP server configuration error: %s!' %
@@ -601,6 +610,7 @@ def main():
         return 1
 
     return 0
+
 
 if __name__ == '__main__':
     try:

@@ -568,7 +568,7 @@ def main():
     parser.add_option("-D", "--debug", dest="loglevel", action="store_const",
                       const=logging.DEBUG, help="Output debugging information")
     parser.add_option("-d", "--dynamic-file-handler", dest="dynamic_file_handler",
-                      help="Definition of the callback in the form module/file:function")
+                      help="Definition of the callback in the form module/file:function or dotted.module.path")
     parser.add_option("-i", "--ignore-invalid-ack", dest="ignore_invalid_ack", action="store_true",
                       help="Ignore invalid acknowledgements, instead of aborting", default=False)
 
@@ -587,14 +587,22 @@ def main():
 
     dynamic_file_callback = None
     if options.dynamic_file_handler:
-        import imp
-        file, func = options.dynamic_file_handler.split(':')
-        path, file = os.path.split(os.path.abspath(file))
-        module_name, _ = os.path.splitext(file)
-        res = imp.find_module(module_name, [path] + sys.path)
-        mod = imp.load_module(module_name, *res)
-        dynamic_file_callback = getattr(mod, func)
-
+        if ':' in options.dynamic_file_handler:
+            import imp
+            file, func = options.dynamic_file_handler.split(':')
+            path, file = os.path.split(os.path.abspath(file))
+            module_name, _ = os.path.splitext(file)
+            res = imp.find_module(module_name, [path] + sys.path)
+            mod = imp.load_module(module_name, *res)
+            dynamic_file_callback = getattr(mod, func)
+        else:
+            # plain dotted module path
+            import importlib
+            mod_tokens = options.dynamic_file_handler.split('.')
+            module = ".".join(mod_tokens[:-1])
+            func = mod_tokens[-1]
+            loaded_module = importlib.import_module(module)
+            dynamic_file_callback = getattr(loaded_module, func)
     try:
         server = TFTPServer(iface, root, options.port, options.strict_rfc1350,
                             dynamic_file_callback=dynamic_file_callback, ignore_invalid_ack=options.ignore_invalid_ack)

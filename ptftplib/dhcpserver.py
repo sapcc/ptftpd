@@ -58,13 +58,13 @@ DHCP_OP_DHCPACK = 5
 # DHCP options we care about.
 DHCP_OPTION_SUBNET = 1                # Subnet mask
 DHCP_OPTION_ROUTER = 3                # Router
+DHCP_OPTION_DNS = 6                   # Domain Name Servers (DNS)
 DHCP_OPTION_REQUESTED_IP = 50         # Requested IP address
 DHCP_OPTION_LEASE_TIME = 51           # Lease time for the IP address
 DHCP_OPTION_OP = 53                   # The DHCP operation (see above)
 DHCP_OPTION_SERVER_ID = 54            # Server Identifier (IP address)
-DHCP_OPTION_PXE_REQ = 55              # The most basic PXE option. We
-                                      # only use this to identify PXE
-                                      # requests.
+DHCP_OPTION_VENDOR_CLASS_ID = 60      # The vendor class identifier, used
+                                      # to identify PXE clients
 DHCP_OPTION_CLIENT_UUID = 61          # The client machine UUID
 DHCP_OPTION_PXE_VENDOR = 43           # PXE vendor extensions
 DHCP_OPTION_CLIENT_UUID2 = 97         # The client machine UUID
@@ -100,7 +100,7 @@ def get_ip_config_for_iface(iface):
 
     import fcntl
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ifname = struct.pack('256s', iface[:15])
+    ifname = struct.pack('256s', iface[:15].encode())
     ip = fcntl.ioctl(s.fileno(), SIOCGIFADDR, ifname)
     mask = fcntl.ioctl(s.fileno(), SIOCGIFNETMASK, ifname)
     mac = fcntl.ioctl(s.fileno(), SIOCGIFHWADDR, ifname)
@@ -215,7 +215,7 @@ class DhcpPacket(object):
                   len(value[1:]) == DHCP_CLIENT_UUID_LENGTH):
                 # First byte of the UUID is \0
                 self.uuid = _unpack_uuid(value[1:])
-            elif option == DHCP_OPTION_PXE_REQ:
+            elif option == DHCP_OPTION_VENDOR_CLASS_ID and value.startswith('PXEClient'):
                 self.is_pxe_request = True
             elif option == DHCP_OPTION_REQUESTED_IP:
                 self.requested_ip = _unpack_ip(value)
@@ -226,12 +226,15 @@ class DhcpPacket(object):
 
 
 class DHCPServer(object):
-    def __init__(self, interface, bootfile, router=None, tftp_server=None):
+    def __init__(self, interface, bootfile, router=None, tftp_server=None,
+                 answer_all_requests=False, name_servers=None):
         self.interface = interface
         self.ip, self.netmask, self.mac = get_ip_config_for_iface(interface)
+        self.name_servers = name_servers
         self.bootfile = bootfile
         self.router = router or self.ip
         self.tftp_server = tftp_server or self.ip
+        self.answer_all_requests = answer_all_requests
         self.ips_allocated = {}
 
         self.sock = socket.socket(socket.PF_PACKET, socket.SOCK_RAW)
@@ -248,7 +251,7 @@ class DHCPServer(object):
                 continue
 
     def handle_dhcp_request(self, pkt):
-        if not pkt.is_pxe_request:
+        if not pkt.is_pxe_request and not self.answer_all_requests:
             l.info('Ignoring non-PXE DHCP request')
             return
 
@@ -305,13 +308,20 @@ class DHCPServer(object):
             DHCP_OP_DHCPDISCOVER: DHCP_OP_DHCPOFFER,
             DHCP_OP_DHCPREQUEST: DHCP_OP_DHCPACK
             }[request_pkt.op]
-        dhcp_options = (
+        dhcp_options = [
             (DHCP_OPTION_OP, chr(reply_kind)),
             (DHCP_OPTION_LEASE_TIME, struct.pack('!L', DHCP_LEASE_TIMEOUT)),
             (DHCP_OPTION_SUBNET, _pack_ip(self.netmask)),
             (DHCP_OPTION_ROUTER, _pack_ip(self.router)),
             (DHCP_OPTION_SERVER_ID, _pack_ip(self.ip)),
-            )
+            ]
+
+        if self.name_servers:
+            dns_servers = ''
+            for name_server in self.name_servers:
+                dns_servers += _pack_ip(name_server)
+            dhcp_options.append((DHCP_OPTION_DNS, dns_servers))
+
         buf = []
         for code, data in dhcp_options:
             buf.append(struct.pack('!BB', code, len(data)))
@@ -382,6 +392,12 @@ def main():
     parser.add_option("-g", "--gateway", dest="router",
                       help="The IP address of the default gateway, if not "
                       "this machine", default=None)
+    parser.add_option("-a", "--answer-all-dhcp-requests", dest="answer_all_requests",
+                      help="Enables DHCP response to all clients, "
+                           "default is PXE clients only", action="store_true", default=False)
+    parser.add_option("-n", "--name-servers", dest="name_servers", action='append', metavar='NAME_SERVER',
+                      help="Domain Name Servers (DNS) IPs to provide to DHCP client. "
+                           "Use multiple flags to specify up to 3 DNS servers", default=None)
     parser.add_option("-v", "--verbose", dest="loglevel", action="store_const",
                       const=logging.INFO, help="Output information messages",
                       default=logging.WARNING)
@@ -389,6 +405,11 @@ def main():
     (options, args) = parser.parse_args()
 
     if len(args) != 2:
+        parser.print_help()
+        return 1
+
+    if options.name_servers and len(options.name_servers) > 3:
+        print('Error: up to 3 DNS servers allowed\n')
         parser.print_help()
         return 1
 
@@ -401,7 +422,8 @@ def main():
 
     try:
         server = DHCPServer(iface, bootfile, router=options.router,
-                            tftp_server=options.tftp_server)
+                            tftp_server=options.tftp_server,
+                            answer_all_requests=options.answer_all_requests)
         server.serve_forever()
     except socket.error as e:
         sys.stderr.write('Socket error (%s): %s!\n' %

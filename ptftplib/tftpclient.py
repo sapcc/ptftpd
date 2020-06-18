@@ -40,13 +40,13 @@ Note that this program currently does *not* support the timeout
 interval option from RFC2349.
 """
 
-from datetime import datetime
 import os
 import shutil
 import socket
 import stat
 import sys
 import tempfile
+import time
 
 from . import notify
 from . import proto
@@ -55,7 +55,7 @@ from . import state
 l = notify.getLogger('tftp')
 
 # UDP datagram size
-_UDP_TRANSFER_SIZE = 8192
+_UDP_TRANSFER_SIZE = 2**16
 
 _PTFTP_DEFAULT_PORT = 69
 _PTFTP_DEFAULT_HOST = 'localhost'
@@ -63,11 +63,75 @@ _PTFTP_DEFAULT_MODE = 'octet'
 
 _PTFTP_DEFAULT_OPTS = {
     proto.TFTP_OPTION_BLKSIZE: proto.TFTP_LAN_PACKET_SIZE,
+    proto.TFTP_OPTION_WINDOWSIZE: proto.TFTP_LAN_WINDOW_SIZE,
 }
 
 _PTFTP_RFC1350_OPTS = {
     proto.TFTP_OPTION_BLKSIZE: proto.TFTP_DEFAULT_PACKET_SIZE,
 }
+
+
+# noinspection PyPep8Naming
+class UDPMessageSocket(object):
+    """A wrapper around a UDP datagram socket that provides per-message
+    receival semantics.
+
+    This wrapper is very specific to the TFTP client use case. Messages are
+    expected to be received one at a time, expect for DATA messages which may
+    come streaming when a window size greater than one is negotiated between
+    the client and the server. When that's the case, reading from the socket
+    returns more than one message but the client (and its state machine) still
+    expects to process them one at a time.
+
+    By utilizing the knowledge of the expected size of those DATA messages
+    (based on the negotiated block size) this wrapper slices the received data
+    accordingly to expose the desired one-at-a-time semantics.
+    """
+
+    def __init__(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.reset()
+
+    @property
+    def rport(self):
+        return self._rport
+
+    def settimeout(self, timeout):
+        self._sock.settimeout(timeout)
+
+    def send(self, message, peer):
+        self._sock.sendto(message, peer)
+
+    def reset(self):
+        self._buffer = None
+        self._rport = None
+
+    def close(self):
+        self._sock.close()
+
+    def recv(self, blksize):
+        if not self._buffer:
+            self._recv()
+        if not self._buffer:
+            return None
+
+        opcode = proto.TFTPHelper.get_opcode(self._buffer)
+        if opcode == proto.OP_DATA:
+            size = proto.TFTPHelper.get_data_size(blksize)
+            data, self._buffer = self._buffer[:size], self._buffer[size:]
+        else:
+            data, self._buffer = self._buffer, None
+
+        return data
+
+    def _recv(self):
+        (data, (address, port)) = self._sock.recvfrom(_UDP_TRANSFER_SIZE)
+        if not self._rport:
+            self._rport = port
+        elif port != self._rport:
+            # Ignore packets from other peers
+            return
+        self._buffer = data
 
 
 # noinspection PyPep8Naming
@@ -128,7 +192,7 @@ class TFTPClient(object):
           None.
         """
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock = UDPMessageSocket()
         self.sock.settimeout(state.STATE_TIMEOUT_SECS)
         print('Connected to {}:{}.'.format(self.peer[0], self.peer[1]))
 
@@ -176,6 +240,8 @@ class TFTPClient(object):
                 self.mode(cmd_parts[1:])
             elif cmd_parts[0] in ('b', 'blksize'):
                 self.blksize(cmd_parts[1:])
+            elif cmd_parts[0] in ('w', 'windowsize'):
+                self.windowsize(cmd_parts[1:])
             else:
                 print('Unrecognized command. Try help.')
 
@@ -195,6 +261,7 @@ class TFTPClient(object):
         print('q  quit                  Quit the TFTP client')
         print('m  mode [newmode]        Display or change transfer mode')
         print('b  blksize [newsize]     Display or change the transfer block size')
+        print('w  windowsize [newsize]  Display or change the transfer window size')
         print()
         print('g  get [-f] <filename>   Get <filename> from server.')
         print('                         (use -f to overwrite local file)')
@@ -216,69 +283,50 @@ class TFTPClient(object):
 
         # Reset the error flag
         self.error = False
-
-        # UDP recv size is _UDP_TRANSFER_SIZE or more if required by
-        # the used block size.
-        recvsize = _UDP_TRANSFER_SIZE
-        if self.opts[proto.TFTP_OPTION_BLKSIZE] > recvsize:
-            recvsize = self.opts[proto.TFTP_OPTION_BLKSIZE] + 4
+        self.sock.reset()
 
         # Process incoming packet until the state is cleared by the
         # end of a succesfull transmission or an error
         while not self.PTFTP_STATE.done and not self.error:
             try:
-                (request, (raddress, rport)) = self.sock.recvfrom(recvsize)
-                if not len(request):
-                    (request, (raddress, rport)) = self.sock.recvfrom(recvsize)
-
-                # Still nothing?
-                if not len(request):
-                    self.error = (True, 'Communication error.')
-                    return
+                blksize = self.opts[proto.TFTP_OPTION_BLKSIZE]
+                request = self.sock.recv(blksize)
+                if not request:
+                    continue
             except socket.timeout:
                 self.error = (True, 'Connection timed out.')
                 return
 
             if not self.PTFTP_STATE.tid:
-                self.PTFTP_STATE.tid = rport
+                self.PTFTP_STATE.tid = self.sock.rport
                 print('Communicating with {}:{}.'
                       .format(self.peer[0], self.PTFTP_STATE.tid))
-
-            if self.PTFTP_STATE.tid != rport:
-                l.debug(
-                    'Ignoring packet from {}:{}, we are connected to {}:{}.'
-                    .format(raddress, rport, raddress, self.peer[0],
-                            self.PTFTP_STATE.tid))
-                continue
 
             # Reset the response packet
             response = None
 
             # Get the packet opcode and dispatch
-            opcode = proto.TFTPHelper.getOP(request)
+            opcode = proto.TFTPHelper.get_opcode(request)
             if not opcode:
                 self.error = (True, None)
                 response = proto.TFTPHelper.createERROR(proto.ERROR_ILLEGAL_OP)
             elif opcode not in proto.TFTP_OPS:
                 self.error = (True,
-                              "Unknown or unsupported operation %d!" % opcode)
+                              'Unknown or unsupported operation %d!' % opcode)
                 response = proto.TFTPHelper.createERROR(proto.ERROR_ILLEGAL_OP)
-                return
             else:
                 try:
-                    handler = getattr(self, "serve%s" % proto.TFTP_OPS[opcode])
+                    handler = getattr(self, 'serve' + proto.TFTP_OPS[opcode])
+                    response = handler(opcode, request[2:])
                 except AttributeError:
                     self.error = (True, 'Operation not supported.')
                     response = proto.TFTPHelper.createERROR(
                             proto.ERROR_UNDEF, 'Operation not supported.')
 
-                if not response:
-                    response = handler(opcode, request[2:])
-
             # Finally, send the response if we have one
             if response:
-                self.sock.sendto(response,
-                                 (self.peer[0], self.PTFTP_STATE.tid))
+                peer = (self.peer[0], self.PTFTP_STATE.tid)
+                self.sock.send(response, peer)
 
     def serveOACK(self, op, request):
         """
@@ -489,14 +537,14 @@ class TFTPClient(object):
             opts[proto.TFTP_OPTION_TSIZE] = 0
 
         # Everything's OK, let's go
-        print("Retrieving '%s' from the remote host..." % filename)
+        print('Retrieving "%s" from the remote host...' % filename)
 
         packet = proto.TFTPHelper.createRRQ(filepath, self.transfer_mode, opts)
 
-        transfer_start = datetime.today()
-        self.sock.sendto(packet, self.peer)
+        transfer_start = time.time()
+        self.sock.send(packet, self.peer)
         self.handle()
-        transfer_time = datetime.today() - transfer_start
+        transfer_time = time.time() - transfer_start
 
         if self.error:
             error, errmsg = self.error
@@ -564,14 +612,14 @@ class TFTPClient(object):
             opts[proto.TFTP_OPTION_TSIZE] = self.PTFTP_STATE.filesize
 
         # Everything's OK, let's go
-        print("Pushing '%s' to the remote host..." % filepath)
+        print('Pushing "%s" to the remote host...' % filepath)
 
         packet = proto.TFTPHelper.createWRQ(filepath, self.transfer_mode, opts)
 
-        transfer_start = datetime.today()
-        self.sock.sendto(packet, self.peer)
+        transfer_start = time.time()
+        self.sock.send(packet, self.peer)
         self.handle()
-        transfer_time = datetime.today() - transfer_start
+        transfer_time = time.time() - transfer_start
 
         if self.error:
             error, errmsg = self.error
@@ -620,26 +668,45 @@ class TFTPClient(object):
         except ValueError:
             print('Block size must be a number!')
 
+    def windowsize(self, args):
+        if len(args) > 1:
+            print('Usage: windowsize [newsize]')
+            return
+
+        if not len(args):
+            print('Current window size: {} packet(s).'
+                  .format(self.opts[proto.TFTP_OPTION_WINDOWSIZE]))
+            return
+
+        try:
+            self.opts[proto.TFTP_OPTION_WINDOWSIZE] = int(args[0])
+            print('Window size set to {} packet(s).'
+                  .format(self.opts[proto.TFTP_OPTION_WINDOWSIZE]))
+        except ValueError:
+            print('Window size must be a number!')
+
     def __get_speed(self, filesize, time):
-        return (filesize / 1024.0 /
-                (time.seconds + time.microseconds / 1000000.0))
+        return filesize / 1024.0 / time
 
 
 def usage():
-    print("usage: %s [options]" % sys.argv[0])
+    print('usage: %s [options]' % sys.argv[0])
     print()
-    print("  -?    --help         Get help")
-    print("  -h    --host <host>  Set TFTP server (default: %s)" % _PTFTP_DEFAULT_HOST)
-    print("  -p    --port <port>  Define the port to connect to (default: %d)" % _PTFTP_DEFAULT_PORT)
-    print("  -m    --mode <mode>  Set transfer mode (default: %s)" % _PTFTP_DEFAULT_MODE)
-    print("                       Must be one of:", ', '.join(proto.TFTP_MODES))
+    print('  -?    --help           Get help')
+    print('  -h    --host <host>    Set TFTP server (default: %s)' % _PTFTP_DEFAULT_HOST)
+    print('  -p    --port <port>    Define the port to connect to (default: %d)' % _PTFTP_DEFAULT_PORT)
+    print('  -m    --mode <mode>    Set transfer mode (default: %s)' % _PTFTP_DEFAULT_MODE)
+    print('                         Must be one of:', ', '.join(proto.TFTP_MODES))
     print()
-    print("Available extra options (using the TFTP option extension protocol):")
-    print("  -b    --blksize <n>  Set transfer block size (default: %d bytes)" % proto.TFTP_LAN_PACKET_SIZE)
+    print('Available extra options (using the TFTP option extension protocol):')
+    print('  -b    --blksize <n>    Set transfer block size (default: %d bytes)' % proto.TFTP_LAN_PACKET_SIZE)
+    print('                         Must be between %d and %d' % (proto.TFTP_BLKSIZE_MIN, proto.TFTP_BLKSIZE_MAX))
+    print('  -w    --windowsize <n> Set streaming window size (default: %d)' % proto.TFTP_LAN_WINDOW_SIZE)
+    print('                         Must be between %d and %d' % (proto.TFTP_WINDOWSIZE_MIN, proto.TFTP_WINDOWSIZE_MAX))
     print()
-    print("To disable the use of TFTP extensions:")
-    print("  -r    --rfc1350      Strictly comply to the RFC1350 only (no extensions)")
-    print("                       This will discard other TFTP option values.")
+    print('To disable the use of TFTP extensions:')
+    print('  -r    --rfc1350        Strictly comply to the RFC1350 only (no extensions)')
+    print('                         This will discard other TFTP option values.')
     print()
 
 
@@ -648,10 +715,11 @@ def main():
     import getopt
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], '?h:p:b:m:r',
+        opts, args = getopt.getopt(sys.argv[1:], '?h:p:b:w:m:r',
                                    ['help', 'host=',
                                     'port=', 'blksize=',
-                                    'mode=', 'rfc1350'])
+                                    'windowsize=', 'mode=',
+                                    'rfc1350'])
     except getopt.GetoptError:
         usage()
         return 1
@@ -679,6 +747,12 @@ def main():
                 exts[proto.TFTP_OPTION_BLKSIZE] = int(val)
             except ValueError:
                 print('Block size must be a number!')
+                return 2
+        if opt in ('-w', '--windowsize'):
+            try:
+                exts[proto.TFTP_OPTION_WINDOWSIZE] = int(val)
+            except ValueError:
+                print('Window size must be a number!')
                 return 2
         if opt in ('-m', '--mode'):
             if val in proto.TFTP_MODES:

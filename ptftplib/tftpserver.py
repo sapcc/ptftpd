@@ -74,7 +74,7 @@ def get_max_udp_datagram_size():
         val = subprocess.check_output(['sysctl', '-n', 'net.inet.udp.maxdgram'])
         return int(val)
     except subprocess.CalledProcessError:
-        return 65535
+        return 1500
 
 
 class TFTPServerConfigurationError(Exception):

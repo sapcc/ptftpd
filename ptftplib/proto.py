@@ -67,7 +67,7 @@ TFTP_PACKETNUM_RESET = 0
 TFTP_OPCODE_LEN = 2
 
 OP_RRQ = 1
-OP_WRQ = 2
+#OP_WRQ = 2
 OP_DATA = 3
 OP_ACK = 4
 OP_ERROR = 5
@@ -75,7 +75,7 @@ OP_OACK = 6
 
 TFTP_OPS = {
     OP_RRQ: 'RRQ',
-    OP_WRQ: 'WRQ',
+    #OP_WRQ: 'WRQ',
     OP_DATA: 'DATA',
     OP_ACK: 'ACK',
     OP_ERROR: 'ERROR',

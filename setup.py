@@ -18,39 +18,9 @@
 # You should have received a copy of the GNU General Public License
 # along with pTFTPd.  If not, see <http://www.gnu.org/licenses/>.
 
-from setuptools import setup, find_packages
-
-with open('ptftplib/version.py') as f:
-    exec(f.read())
-
-with open('README.rst') as readme:
-    long_description = readme.read()
-
-with open('requirements.txt') as f:
-    requirements = [line.strip() for line in f.readlines()]
+from setuptools import setup
 
 setup(
-    name=name,  # noqa
-    version=version,  # noqa
-    author='Maxime Petazzoni',
-    author_email='maxime.petazzoni@bulix.org',
-    description='pTFTPd, a pure-Python TFTP tool suite that works',
-    license='GNU General Public License v2',
-    long_description=long_description,
-    zip_safe=True,
-    install_requires=requirements,
-    packages=find_packages(),
-    entry_points={
-        'console_scripts':
-            ['bootpd=ptftplib.bootpserver:main',
-             'dhcpd=ptftplib.dhcpserver:main',
-             'ptftp=ptftplib.tftpclient:main',
-             'ptftpd=ptftplib.tftpserver:main',
-             'pxed=ptftplib.pxeserver:main'],
-    },
-    classifiers=[
-        'Operating System :: OS Independent',
-        'Programming Language :: Python',
-    ],
-    url='https://github.com/mpetazzoni/ptftpd',
+    setup_requires=['pbr>=2.0.0'],
+    pbr=True
 )

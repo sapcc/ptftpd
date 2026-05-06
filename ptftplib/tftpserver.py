@@ -199,15 +199,15 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
                 opts = proto.TFTPHelper.parse_options(opts)
                 if opts:
                     blksize = opts[proto.TFTP_OPTION_BLKSIZE]
-                    windowsize = opts[proto.TFTP_OPTION_WINDOWSIZE]
+                    windowsize = int(opts.get(proto.TFTP_OPTION_WINDOWSIZE, proto.TFTP_LAN_WINDOW_SIZE) or 1)
                     max_window_size = int(
                             get_max_udp_datagram_size() /
                             proto.TFTPHelper.get_data_size(blksize))
-                    if windowsize > max_window_size:
-                        l.info('Restricting window size to %d to fit UDP.',
-                               max_window_size)
-                        opts[proto.TFTP_OPTION_WINDOWSIZE] = max_window_size
-
+                    windowsize = max(1, min(windowsize, max_window_size))
+                    # ensure server/client agree on negotiated value
+                    opts[proto.TFTP_OPTION_WINDOWSIZE] = windowsize
+                    l.info('Clamped window size to %d to fit UDP.',
+                               windowsize)
                     # HOOK: this is where we should check that we accept
                     # the options requested by the client.
 

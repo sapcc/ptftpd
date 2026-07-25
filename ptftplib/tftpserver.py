@@ -55,7 +55,7 @@ l = notify.getLogger('tftpd')
 _PTFTPD_SERVER_NAME = 'pFTPd'
 _PTFTPD_DEFAULT_PORT = 69
 _PTFTPD_DEFAULT_PATH = '/tftpboot'
-
+MAX_TFTP_BLOCKSIZE = 1428
 
 def get_ip_config_for_iface(iface):
     """Retrieve and return the IP address/netmask of the given interface."""
@@ -199,15 +199,23 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
                 opts = proto.TFTPHelper.parse_options(opts)
                 if opts:
                     blksize = opts[proto.TFTP_OPTION_BLKSIZE]
-                    windowsize = opts[proto.TFTP_OPTION_WINDOWSIZE]
+                    if blksize > MAX_TFTP_BLOCKSIZE:
+                        l.info(
+                            "Capping requested blksize from %d to %d",
+                            blksize,
+                            MAX_TFTP_BLOCKSIZE,
+                        )
+                        blksize = MAX_TFTP_BLOCKSIZE
+                    opts[proto.TFTP_OPTION_BLKSIZE] = blksize
+                    windowsize = int(opts.get(proto.TFTP_OPTION_WINDOWSIZE, proto.TFTP_LAN_WINDOW_SIZE) or 1)
                     max_window_size = int(
                             get_max_udp_datagram_size() /
                             proto.TFTPHelper.get_data_size(blksize))
-                    if windowsize > max_window_size:
-                        l.info('Restricting window size to %d to fit UDP.',
-                               max_window_size)
-                        opts[proto.TFTP_OPTION_WINDOWSIZE] = max_window_size
-
+                    windowsize = max(1, min(windowsize, max_window_size))
+                    # ensure server/client agree on negotiated value
+                    opts[proto.TFTP_OPTION_WINDOWSIZE] = windowsize
+                    l.info('Clamped window size to %d to fit UDP.',
+                               windowsize)
                     # HOOK: this is where we should check that we accept
                     # the options requested by the client.
 
@@ -350,23 +358,30 @@ class TFTPServerHandler(socketserver.DatagramRequestHandler):
             return peer_state.next()
 
         elif peer_state.state == state.STATE_SEND:
-            if peer_state.packetnum == num + 1:
-                # Ignore duplicate N-1 ACK packets
-                l.debug('Got duplicate ACK packet #%d. Ignoring.', num)
-                pass
-            elif peer_state.packetnum != num:
-                # TODO: handle ACK recovery when operating in streaming mode.
+            # ACK must not acknowledge data we have not sent.
+            # Required for RFC7440 windowsize transfers.
+            if num > peer_state.packetnum:
                 peer_state.state = state.STATE_ERROR
                 peer_state.error = proto.ERROR_ILLEGAL_OP
-                l.error('Got ACK with incoherent data packet number. '
-                        'Aborting transfer.',
-                        extra=peer_state.extra(notify.TRANSFER_FAILED))
+                l.error(
+                    'ACK %d is ahead of sent packet %d',
+                    num,
+                    peer_state.packetnum,
+                    extra=peer_state.extra(notify.TRANSFER_FAILED)
+                )
+                return peer_state.next()
+
+            # Ignore duplicate/old ACKs
+            if num < peer_state.last_acked:
+                l.debug('Ignoring old ACK #%d', num)
+                return peer_state.next()
+
+            peer_state.last_acked = num
 
             if not self.server.strict_rfc1350 and \
                     num == proto.TFTP_PACKETNUM_MAX - 1:
                 l.debug('Packet number wraparound.')
 
-            peer_state.last_acked = num
             return peer_state.next()
 
         elif peer_state.state == state.STATE_RECV and num == 0:
